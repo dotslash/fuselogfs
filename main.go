@@ -6,13 +6,9 @@ import (
 	"fmt"
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseutil"
-	"github.com/rs/zerolog"
-	stdlog "log"
 	"os"
 	"os/signal"
 	"os/user"
-	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -29,54 +25,15 @@ func getUserOrDie() *user.User {
 	return usr
 }
 
-func makeLogDirOrDie() string {
-	usr := getUserOrDie()
-	logDir := filepath.Join(usr.HomeDir, "logs")
-	panicOnErr(os.MkdirAll(logDir, 0755))
-	return logDir
-}
-
-// TODO: Im pretty sure there is a better way to do logging.
-func makeLogger(component string, caller bool, logToFile bool) zerolog.Logger {
-	var logFile = os.Stdout
-	if logToFile {
-		zerolog.SetGlobalLevel(zerolog.InfoLevel)
-		logDir := makeLogDirOrDie()
-		var err error
-		logFile, err = os.OpenFile(filepath.Join(logDir, "fusefs.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
-		panicOnErr(err)
+func unmount(mountDir string) {
+	logger.Warn().Msg("Attempting to unmount fuse")
+	err := fuse.Unmount(mountDir)
+	if err != nil {
+		logger.Err(err).Msg("Failed to unmount")
+	} else {
+		logger.Warn().Msg("Unmounting fuse successful")
 	}
-
-	output := zerolog.ConsoleWriter{Out: logFile, TimeFormat: time.RFC3339}
-	output.FormatLevel = func(i interface{}) string {
-		if i == nil {
-			i = "na"
-		}
-		return strings.ToUpper(fmt.Sprintf("| %-6s|", i))
-	}
-	ctx := zerolog.
-		New(output).
-		With().
-		Timestamp().
-		Str("Name", component)
-	if caller {
-		ctx = ctx.Caller()
-	}
-	l := ctx.Logger()
-	return l
 }
-
-func makeStdLogger(component string, logToFile bool) *stdlog.Logger {
-	zlog := makeLogger(component, false, logToFile)
-	zlog = zlog.Level(zerolog.InfoLevel)
-	ret := stdlog.New(os.Stdout, "", 0)
-	ret.SetFlags(0)
-	ret.SetPrefix("")
-	ret.SetOutput(zlog)
-	return ret
-}
-
-var logger zerolog.Logger
 
 func registerSIGINTHandler(mountDir string) {
 	// Register for SIGINT.
@@ -98,15 +55,7 @@ func registerSIGINTHandler(mountDir string) {
 			// Unmount asynchronously so that the user can issue a ^c again if the first one
 			// is stuck.
 			// TODO: When does unmount get "stuck"?
-			go func() {
-				logger.Warn().Msg("Attempting to unmount fuse")
-				err := fuse.Unmount(mountDir)
-				if err != nil {
-					logger.Err(err).Msg("Failed to unmount")
-				} else {
-					logger.Warn().Msg("Unmounting fuse successful")
-				}
-			}()
+			go unmount(mountDir)
 			// Sleep just to make sure we dont panic if the user does ^c impatiently
 			time.Sleep(time.Second)
 		}
@@ -115,7 +64,7 @@ func registerSIGINTHandler(mountDir string) {
 
 func main() {
 	mountDir := flag.String("mount_dir", "/tmp/fool", "Mount destination")
-	stageDir := flag.String("stage_dir", "/tmp/foolstage", "Mount destination")
+	stageDir := flag.String("stage_dir", "/tmp/foolstage", "Original location of the files exported by fuse")
 	logToFile := flag.Bool("log_to_file", true, "Whether to log to file or not")
 
 	flag.Parse()
@@ -149,5 +98,7 @@ func main() {
 	}
 	registerSIGINTHandler(*mountDir)
 	err = mfs.Join(context.Background())
-	logger.Err(err)
+	if err != nil {
+		logger.Err(err).Msg("Program exited with error")
+	}
 }

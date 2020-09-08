@@ -80,7 +80,7 @@ func (fh *FileWriteHandle) ensureFile(fs *FuseLogFs) (*os.File, error) {
 type FuseLogFs struct {
 	fuseutil.FileSystem
 
-	stageDir    string
+	stageDir string
 	// TODO: I need to access inodes, pathToInode using a lock.
 	inodes      map[fuseops.InodeID]*Inode
 	pathToInode map[string]fuseops.InodeID
@@ -90,9 +90,9 @@ type FuseLogFs struct {
 	fileWriteHandles map[fuseops.HandleID]*FileWriteHandle
 
 	// Mutex for file system operations (adding nodes, incrementing inode number etc)
-	fsmu             sync.Mutex
+	fsmu sync.Mutex
 	// Mutex for file operations (unlink, write etc)
-	filemu           sync.Mutex
+	filemu sync.Mutex
 
 	// UID and GID of the user that is running the the fuse fs.
 	uid uint32
@@ -369,7 +369,6 @@ func (fs *FuseLogFs) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp) e
 	stagePath := filePath(*parStagePath, op.Name)
 	stat, err := os.Stat(stagePath)
 	if err != nil {
-		logger.Debug().Msgf("%v", err)
 		return mapOsStatError(err)
 	}
 	// Stage has this file. So we must behave as if the file exists.
@@ -382,7 +381,6 @@ func (fs *FuseLogFs) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp) e
 		AttributesExpiration: time.Now().Add(cacheDuration),
 		EntryExpiration:      time.Now().Add(cacheDuration),
 	}
-	//logger.Info().Msgf("LookupInode: %+v", node)
 	return nil
 }
 
@@ -460,12 +458,10 @@ func (fs *FuseLogFs) CreateFile(_ context.Context, op *fuseops.CreateFileOp) (er
 
 	_, err = os.Stat(childStagePath)
 	if err == nil {
-		logger.Debug().Msgf("Remote EEXIST")
 		return syscall.EEXIST
 	} else if !os.IsNotExist(err) {
 		return err
-	} else if in, valid := fs.getInodeFromPath(childPath); valid {
-		logger.Info().Msgf("potentially weird eexist %v %v", in, valid)
+	} else if _, valid := fs.getInodeFromPath(childPath); valid {
 		return syscall.EEXIST
 	}
 
@@ -561,8 +557,6 @@ func (fs *FuseLogFs) WriteFile(_ context.Context, op *fuseops.WriteFileOp) (err 
 
 	fs.filemu.Lock()
 	defer fs.filemu.Unlock()
-
-	logger.Debug().Msgf("WriteFile: %v %v %v", op.Handle, op.Inode, op.Offset)
 
 	handle, err := fs.getWriteFileHandle(op.Inode, op.Handle)
 	if err != nil {
@@ -950,7 +944,7 @@ func (*FuseLogFs) Destroy() {
 
 // Misc functions
 
-// TODO: Why not filepath.Join
+// TODO: Why not filepath.Join?
 func filePath(parPath, childName string) string {
 	c := strings.HasPrefix(childName, "/")
 	p := strings.HasSuffix(parPath, "/")
