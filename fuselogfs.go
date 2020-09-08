@@ -10,7 +10,9 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"os/user"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -79,18 +81,47 @@ type FuseLogFs struct {
 	fuseutil.FileSystem
 
 	stageDir    string
+	// TODO: I need to access inodes, pathToInode using a lock.
 	inodes      map[fuseops.InodeID]*Inode
 	pathToInode map[string]fuseops.InodeID
 
 	lastInode        fuseops.InodeID
 	lastHandleId     fuseops.HandleID
 	fileWriteHandles map[fuseops.HandleID]*FileWriteHandle
+
+	// Mutex for file system operations (adding nodes, incrementing inode number etc)
 	fsmu             sync.Mutex
+	// Mutex for file operations (unlink, write etc)
 	filemu           sync.Mutex
-	count            int
+
+	// UID and GID of the user that is running the the fuse fs.
+	uid uint32
+	gid uint32
 }
 
-func (fs *FuseLogFs) Init() {
+func NewFuseLogFs(stageDir string, usr *user.User) (*FuseLogFs, error) {
+	uid, err := strconv.ParseUint(usr.Uid, 10, 32)
+	if err != nil {
+		return nil, err
+	}
+	gid, err := strconv.ParseUint(usr.Gid, 10, 32)
+	if err != nil {
+		return nil, err
+	}
+
+	ret := &FuseLogFs{
+		stageDir:         stageDir,
+		pathToInode:      map[string]fuseops.InodeID{},
+		inodes:           map[fuseops.InodeID]*Inode{},
+		fileWriteHandles: map[fuseops.HandleID]*FileWriteHandle{},
+		uid:              uint32(uid),
+		gid:              uint32(gid),
+	}
+	ret.init()
+	return ret, nil
+}
+
+func (fs *FuseLogFs) init() {
 	fs.addNewInodeInternal(RootInodeId, "/")
 	root, _ := fs.inodes[RootInodeId]
 	root.count = 1 // Root has a reference count of 1 by default.
@@ -100,10 +131,21 @@ func (fs *FuseLogFs) Init() {
 	logger.Error().Msg("INIT Done")
 }
 
-
-
 // ====== HELPERS =======
 
+func (fs *FuseLogFs) osStatToInodeAttrs(stat os.FileInfo, node *Inode) fuseops.InodeAttributes {
+	return fuseops.InodeAttributes{
+		Size:   uint64(stat.Size()),
+		Nlink:  uint32(len(node.paths)),
+		Mode:   stat.Mode(),
+		Atime:  stat.ModTime(),
+		Mtime:  stat.ModTime(),
+		Ctime:  stat.ModTime(),
+		Crtime: time.Unix(0, 0), // TODO: creation time.
+		Uid:    502,             // TODO: This is hardcoded to my current values
+		Gid:    20,              // TODO: ^
+	}
+}
 
 // TODO: Im reasonably certain Im not doing ref counting properly. It does not seem to hurt though.
 func (fs *FuseLogFs) updateRefCount(inode *Inode, change uint64) {
@@ -201,7 +243,6 @@ func (fs *FuseLogFs) getInodeFromPath(path string) (_inode *Inode, _valid bool) 
 	return node, valid
 }
 
-
 // TODO: Stop using the second param in favor fs.stagePath
 // TODO: Be consistent about naming convention for return values
 //  a. Use return values freely in the underlying function (or)
@@ -234,8 +275,6 @@ func (fs *FuseLogFs) newHandleNum() fuseops.HandleID {
 	fs.lastHandleId++
 	return fs.lastHandleId
 }
-
-
 
 // ====== LINKS =======
 
@@ -275,7 +314,7 @@ func (fs *FuseLogFs) CreateLink(_ context.Context, op *fuseops.CreateLinkOp) (er
 
 	op.Entry = fuseops.ChildInodeEntry{
 		Child:                targetNode.id,
-		Attributes:           osStatToInodeAttrs(newStat, targetNode),
+		Attributes:           fs.osStatToInodeAttrs(newStat, targetNode),
 		AttributesExpiration: time.Time{},
 		EntryExpiration:      time.Time{},
 	}
@@ -310,6 +349,8 @@ func (fs *FuseLogFs) ReadSymlink(_ context.Context, op *fuseops.ReadSymlinkOp) e
 // ====== GENERAL =======
 
 func (fs *FuseLogFs) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp) error {
+	// TODO: Accessing fs.inodes directly because getInodeFromId will not return the inode
+	//  if inode.paths is empty. Fix this.
 	inode, ok := fs.inodes[op.Inode]
 	if !ok {
 		return syscall.ENOENT
@@ -337,7 +378,7 @@ func (fs *FuseLogFs) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp) e
 	fs.updateRefCount(node, 1)
 	op.Entry = fuseops.ChildInodeEntry{
 		Child:                node.id,
-		Attributes:           osStatToInodeAttrs(stat, node),
+		Attributes:           fs.osStatToInodeAttrs(stat, node),
 		AttributesExpiration: time.Now().Add(cacheDuration),
 		EntryExpiration:      time.Now().Add(cacheDuration),
 	}
@@ -456,7 +497,7 @@ func (fs *FuseLogFs) CreateFile(_ context.Context, op *fuseops.CreateFileOp) (er
 	op.Handle = handle
 	op.Entry = fuseops.ChildInodeEntry{
 		Child:                newNode.id,
-		Attributes:           osStatToInodeAttrs(stat, newNode),
+		Attributes:           fs.osStatToInodeAttrs(stat, newNode),
 		AttributesExpiration: time.Now().Add(cacheDuration),
 		EntryExpiration:      time.Now().Add(cacheDuration),
 	}
@@ -688,7 +729,7 @@ func (fs *FuseLogFs) MkDir(_ context.Context, op *fuseops.MkDirOp) error {
 	}
 	op.Entry = fuseops.ChildInodeEntry{
 		Child:                childNode.id,
-		Attributes:           osStatToInodeAttrs(stat, childNode),
+		Attributes:           fs.osStatToInodeAttrs(stat, childNode),
 		AttributesExpiration: time.Now().Add(cacheDuration),
 		EntryExpiration:      time.Now().Add(cacheDuration),
 	}
@@ -776,7 +817,7 @@ func (fs *FuseLogFs) GetInodeAttributes(_ context.Context, op *fuseops.GetInodeA
 		return mapOsStatError(err)
 	}
 
-	op.Attributes = osStatToInodeAttrs(stat, node)
+	op.Attributes = fs.osStatToInodeAttrs(stat, node)
 	op.AttributesExpiration = time.Now().Add(cacheDuration)
 	return nil
 }
@@ -820,7 +861,7 @@ func (fs *FuseLogFs) SetInodeAttributes(_ context.Context, op *fuseops.SetInodeA
 		return mapOsStatError(err)
 	}
 
-	op.Attributes = osStatToInodeAttrs(stat, node)
+	op.Attributes = fs.osStatToInodeAttrs(stat, node)
 	op.AttributesExpiration = time.Now().Add(cacheDuration)
 	return nil
 }
@@ -919,20 +960,6 @@ func filePath(parPath, childName string) string {
 		return parPath + childName
 	} else {
 		return parPath + "/" + childName
-	}
-}
-
-func osStatToInodeAttrs(stat os.FileInfo, node *Inode) fuseops.InodeAttributes {
-	return fuseops.InodeAttributes{
-		Size:   uint64(stat.Size()),
-		Nlink:  uint32(len(node.paths)),
-		Mode:   stat.Mode(),
-		Atime:  stat.ModTime(),
-		Mtime:  stat.ModTime(),
-		Ctime:  stat.ModTime(),
-		Crtime: time.Unix(0, 0), // TODO: creation time.
-		Uid:    502,             // TODO: This is hardcoded to my current values
-		Gid:    20,              // TODO: ^
 	}
 }
 

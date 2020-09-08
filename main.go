@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"github.com/jacobsa/fuse"
-	"github.com/jacobsa/fuse/fuseops"
 	"github.com/jacobsa/fuse/fuseutil"
 	"github.com/rs/zerolog"
 	stdlog "log"
@@ -18,12 +17,22 @@ import (
 	"time"
 )
 
-func makeLogDirOrDie() string {
+func panicOnErr(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func getUserOrDie() *user.User {
 	usr, err := user.Current()
 	panicOnErr(err)
+	return usr
+}
+
+func makeLogDirOrDie() string {
+	usr := getUserOrDie()
 	logDir := filepath.Join(usr.HomeDir, "logs")
-	err = os.MkdirAll(logDir, 0755)
-	panicOnErr(err)
+	panicOnErr(os.MkdirAll(logDir, 0755))
 	return logDir
 }
 
@@ -52,11 +61,7 @@ func makeLogger(component string, caller bool) zerolog.Logger {
 	return l
 }
 
-func panicOnErr(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
+
 
 func makeStdLogger(component string) *stdlog.Logger {
 	zlog := makeLogger(component, false)
@@ -101,7 +106,7 @@ func main() {
 		FSName:                  fsname,
 		ReadOnly:                false,
 		ErrorLogger:             makeStdLogger("fuse err"),
-		//DebugLogger:             makeStdLogger("fuse debug"),
+		// DebugLogger:             makeStdLogger("fuse debug"),
 		DisableWritebackCaching: false,
 		EnableVnodeCaching:      false,
 		EnableSymlinkCaching:    false,
@@ -111,13 +116,8 @@ func main() {
 		Options:                 nil,
 		Subtype:                 "",
 	}
-	fs := &FuseLogFs{
-		stageDir:         *stageDir,
-		pathToInode:      map[string]fuseops.InodeID{},
-		inodes:           map[fuseops.InodeID]*Inode{},
-		fileWriteHandles: map[fuseops.HandleID]*FileWriteHandle{},
-	}
-	fs.Init()
+	fs, err := NewFuseLogFs(*stageDir, getUserOrDie())
+	panicOnErr(err)
 	server := fuseutil.NewFileSystemServer(fs)
 	mfs, err := fuse.Mount(*mountDir, server, &mountcfg)
 	if err != nil {
