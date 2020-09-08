@@ -11,13 +11,29 @@ import (
 	stdlog "log"
 	"os"
 	"os/signal"
+	"os/user"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 )
 
+func makeLogDirOrDie() string {
+	usr, err := user.Current()
+	panicOnErr(err)
+	logDir := filepath.Join(usr.HomeDir, "logs")
+	err = os.MkdirAll(logDir, 0755)
+	panicOnErr(err)
+	return logDir
+}
+
 func makeLogger(component string, caller bool) zerolog.Logger {
-	output := zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	logDir := makeLogDirOrDie()
+	logFile, err := os.OpenFile(filepath.Join(logDir, "fusefs.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+	panicOnErr(err)
+
+	output := zerolog.ConsoleWriter{Out: logFile, TimeFormat: time.RFC3339}
 	output.FormatLevel = func(i interface{}) string {
 		if i == nil {
 			i = "na"
@@ -32,7 +48,14 @@ func makeLogger(component string, caller bool) zerolog.Logger {
 	if caller {
 		ctx = ctx.Caller()
 	}
-	return ctx.Logger()
+	l:= ctx.Logger()
+	return l
+}
+
+func panicOnErr(err error) {
+	if err != nil {
+		panic(err)
+	}
 }
 
 func makeStdLogger(component string) *stdlog.Logger {
@@ -78,7 +101,7 @@ func main() {
 		FSName:                  fsname,
 		ReadOnly:                false,
 		ErrorLogger:             makeStdLogger("fuse err"),
-		DebugLogger:             makeStdLogger("fuse debug"),
+		//DebugLogger:             makeStdLogger("fuse debug"),
 		DisableWritebackCaching: false,
 		EnableVnodeCaching:      false,
 		EnableSymlinkCaching:    false,
@@ -102,5 +125,6 @@ func main() {
 		return
 	}
 	// registerSIGINTHandler(*mountDir)
-	mfs.Join(context.Background())
+	err = mfs.Join(context.Background())
+	logger.Err(err)
 }

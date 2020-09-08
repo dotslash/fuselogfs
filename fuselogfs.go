@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/jacobsa/fuse/fuseops"
 	"github.com/jacobsa/fuse/fuseutil"
 	"github.com/pkg/xattr"
+	"io"
 	"io/ioutil"
 	"os"
 	"path"
@@ -16,7 +18,7 @@ import (
 )
 
 const RootInodeId = 1
-const cacheDuration = 10 * time.Second
+const cacheDuration = 100 * time.Millisecond
 
 type Inode struct {
 	id    fuseops.InodeID
@@ -60,17 +62,10 @@ func (fh *FileWriteHandle) ensureFile(fs *FuseLogFs) (*os.File, error) {
 		return fh.file, nil
 	}
 
-	_, stageFile, err := fs.getStageFileAndInode(fh.inode)
+	_, stageFile, err := fs.getInodeFromId(fh.inode)
 	if err != nil {
 		return nil, err
 	}
-	//stat, err := os.Stat(*stageFile)
-	//if err != nil {
-	//	return nil, err
-	//}
-	//if stat.Mode() & os.O_WRONLY == os.O_WRONLY {
-	//
-	//}
 
 	fh.file, err = os.OpenFile(*stageFile, os.O_RDWR, 0666)
 	if err != nil {
@@ -105,18 +100,25 @@ func (fs *FuseLogFs) Init() {
 	logger.Error().Msg("INIT Done")
 }
 
+
+
+// ====== HELPERS =======
+
+
+// TODO: Im reasonably certain Im not doing ref counting properly. It does not seem to hurt though.
 func (fs *FuseLogFs) updateRefCount(inode *Inode, change uint64) {
 	fs.fsmu.Lock()
 	defer fs.fsmu.Unlock()
 	inode.count += change
 	newCnt := inode.count
 	if newCnt == 0 {
+		logger.Info().Msgf("Removing %+v", inode)
 		fs.rmInode(inode)
 	}
 }
 
-// ====== HELPERS =======
-
+// TODO: Better name for "stage". What I call stage is the reality and the fuse fs is the putting up a
+//  performance on a "stage" (i.e mount path) !
 func (fs *FuseLogFs) stagePath(inode *Inode) string {
 	return filePath(fs.stageDir, inode.paths[0])
 }
@@ -130,31 +132,93 @@ func (fs *FuseLogFs) parentInodeId(inode *Inode) *fuseops.InodeID {
 	return &parid
 }
 
+// Does exactly what it says. Use only if addNewOrReuseStaleInode does not work for your use case.
 func (fs *FuseLogFs) addNewInodeInternal(id fuseops.InodeID, path string) *Inode {
 	newNode := &Inode{id: id, paths: []string{path}}
 	fs.inodes[id] = newNode
 	fs.pathToInode[path] = id
+	logger.Info().Msgf("Adding inode %+v", newNode)
 	return newNode
 }
-func (fs *FuseLogFs) addInode(path string) *Inode {
-	inode, oldIsValid := fs.getInode(path)
+
+// If there is no inode for this path, it creates a new one. If there is a stale inode for this path
+// it reuses the stale inode
+// TODO: I think the resuse path is never taken, because reusing stale inodes will cause incorrect behaviour
+//  for hard linking.
+func (fs *FuseLogFs) addNewOrReuseStaleInode(path string) *Inode {
+	inode, oldIsValid := fs.getInodeFromPath(path)
 	if oldIsValid {
 		return nil
 	}
 	if inode != nil {
 		inode.paths = append(inode.paths, path)
 		fs.pathToInode[path] = inode.id
+		logger.Info().Msgf("Reusing stale inode %+v", inode)
 		return inode
 	}
 	return fs.addNewInodeInternal(fs.newInodeNum(), path)
 }
 
 func (fs *FuseLogFs) getOrCreateInode(path string) *Inode {
-	inode, oldIsValid := fs.getInode(path)
+	inode, oldIsValid := fs.getInodeFromPath(path)
 	if oldIsValid {
 		return inode
 	}
-	return fs.addInode(path)
+	return fs.addNewOrReuseStaleInode(path)
+}
+
+func (fs *FuseLogFs) rmInode(inode *Inode) {
+	logger.Info().Msgf("rmInode : %+v", inode)
+	for _, inodePath := range inode.paths {
+		delete(fs.pathToInode, inodePath)
+	}
+	delete(fs.inodes, inode.id)
+}
+
+// valid: true if the node is associated with this inode.
+// This can be false for a Unlink/Rename/RmDir is done on this inode before we remove the
+// inode in the subsequent ForgetInode call.
+func (fs *FuseLogFs) getInodeFromPath(path string) (_inode *Inode, _valid bool) {
+	nodeId, ok := fs.pathToInode[path]
+	if !ok {
+		// InodeId not found
+		return nil, false
+	}
+	node, ok := fs.inodes[nodeId]
+	if !ok {
+		// Node does not exist for the inode id.
+		// TODO: This should really not happen. Add a warning log?
+		return nil, false
+	}
+	// Set valid
+	valid := false
+	for _, p := range node.paths {
+		if p == path {
+			valid = true
+			break
+		}
+	}
+	return node, valid
+}
+
+
+// TODO: Stop using the second param in favor fs.stagePath
+// TODO: Be consistent about naming convention for return values
+//  a. Use return values freely in the underlying function (or)
+//  b. Use them purely for documentation purposes (like in this case _stagePath for documentation and stagePath
+//     in the function body.
+// Unlike getInodeFromPath, this does not need valid because an inode can be valid/invalid w.r.t a path
+// Here we are fetcing the inode from the id.
+func (fs *FuseLogFs) getInodeFromId(id fuseops.InodeID) (_inode *Inode, _stagePath *string, _err error) {
+	node, ok := fs.inodes[id]
+	if !ok {
+		return nil, nil, syscall.ENOENT
+	} else if len(node.paths) == 0 {
+		logger.Info().Msgf("Treating stale node as ENOENT %+v", node)
+		return nil, nil, syscall.ENOENT
+	}
+	stagePath := filePath(fs.stageDir, node.paths[0])
+	return node, &stagePath, nil
 }
 
 func (fs *FuseLogFs) newInodeNum() fuseops.InodeID {
@@ -171,43 +235,23 @@ func (fs *FuseLogFs) newHandleNum() fuseops.HandleID {
 	return fs.lastHandleId
 }
 
-func (fs *FuseLogFs) rmInode(inode *Inode) {
-	for _, inodePath := range inode.paths {
-		delete(fs.pathToInode, inodePath)
-	}
-	delete(fs.inodes, inode.id)
-}
 
-func (fs *FuseLogFs) getInode(path string) (inode *Inode, valid bool) {
-	nodeId, ok := fs.pathToInode[path]
-	if !ok {
-		return nil, false
-	}
-	node, _ := fs.inodes[nodeId]
-	return node, len(node.paths) > 0
-}
-
-func (fs *FuseLogFs) getStageFileAndInode(id fuseops.InodeID) (*Inode, *string, error) {
-	node, ok := fs.inodes[id]
-	logger.Info().Msgf("fs.inodes[id]: %+v %v", node, ok)
-	if !ok {
-		return nil, nil, syscall.ENOENT
-	}
-	stagePath := fs.stageDir + "/" + node.paths[0]
-	logger.Info().Msgf("stagePath: %v", stagePath)
-	return node, &stagePath, nil
-}
 
 // ====== LINKS =======
 
-func (fs *FuseLogFs) CreateLink(_ context.Context, op *fuseops.CreateLinkOp) error {
+func (fs *FuseLogFs) CreateLink(_ context.Context, op *fuseops.CreateLinkOp) (err error) {
+	logger.Info().Msgf("CreateLink begin:  -> %+v", op)
+	defer func() {
+		logger.Info().Msgf("CreateLink end:  -> %+v %v", op, err)
+	}()
+
 	// Get par node info.
-	parNode, _, err := fs.getStageFileAndInode(op.Parent)
+	parNode, _, err := fs.getInodeFromId(op.Parent)
 	if err != nil {
 		return err
 	}
 	// Target node ("old node")
-	targetNode, _, err := fs.getStageFileAndInode(op.Target)
+	targetNode, _, err := fs.getInodeFromId(op.Target)
 	if err != nil {
 		return err
 	}
@@ -239,9 +283,14 @@ func (fs *FuseLogFs) CreateLink(_ context.Context, op *fuseops.CreateLinkOp) err
 	return nil
 }
 
-func (fs *FuseLogFs) CreateSymlink(_ context.Context, op *fuseops.CreateSymlinkOp) error {
+func (fs *FuseLogFs) CreateSymlink(_ context.Context, op *fuseops.CreateSymlinkOp) (err error) {
+	logger.Info().Msgf("CreateSymLink begin:  -> %+v", op)
+	defer func() {
+		logger.Info().Msgf("CreateSymLink end:  -> %+v %v", op, err)
+	}()
+
 	// Get par node info.
-	parNode, _, err := fs.getStageFileAndInode(op.Parent)
+	parNode, _, err := fs.getInodeFromId(op.Parent)
 	if err != nil {
 		return err
 	}
@@ -250,7 +299,7 @@ func (fs *FuseLogFs) CreateSymlink(_ context.Context, op *fuseops.CreateSymlinkO
 }
 
 func (fs *FuseLogFs) ReadSymlink(_ context.Context, op *fuseops.ReadSymlinkOp) error {
-	node, _, err := fs.getStageFileAndInode(op.Inode)
+	node, _, err := fs.getInodeFromId(op.Inode)
 	if err != nil {
 		return err
 	}
@@ -271,7 +320,7 @@ func (fs *FuseLogFs) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp) e
 
 func (fs *FuseLogFs) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp) error {
 	// Get par node info.
-	parNode, parStagePath, err := fs.getStageFileAndInode(op.Parent)
+	parNode, parStagePath, err := fs.getInodeFromId(op.Parent)
 	if err != nil {
 		return err
 	}
@@ -279,9 +328,10 @@ func (fs *FuseLogFs) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp) e
 	stagePath := filePath(*parStagePath, op.Name)
 	stat, err := os.Stat(stagePath)
 	if err != nil {
-		logger.Info().Msgf("%v", err)
+		logger.Debug().Msgf("%v", err)
 		return mapOsStatError(err)
 	}
+	// Stage has this file. So we must behave as if the file exists.
 	// Get/Create Inode for the child entry and set the Attributes in response.
 	node := fs.getOrCreateInode(filePath(parNode.paths[0], op.Name))
 	fs.updateRefCount(node, 1)
@@ -291,6 +341,7 @@ func (fs *FuseLogFs) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp) e
 		AttributesExpiration: time.Now().Add(cacheDuration),
 		EntryExpiration:      time.Now().Add(cacheDuration),
 	}
+	//logger.Info().Msgf("LookupInode: %+v", node)
 	return nil
 }
 
@@ -301,28 +352,39 @@ func mapOsStatError(err error) error {
 	return err
 }
 
-func (fs *FuseLogFs) Rename(_ context.Context, op *fuseops.RenameOp) error {
+func (fs *FuseLogFs) Rename(_ context.Context, op *fuseops.RenameOp) (err error) {
+	logger.Info().Msgf("Rename begin:  -> %+v", op)
+	defer func() {
+		logger.Info().Msgf("Rename end:  -> %+v %v", op, err)
+	}()
+
 	fs.filemu.Lock()
 	defer fs.filemu.Unlock()
 
-	oldParNode, _, err := fs.getStageFileAndInode(op.OldParent)
+	oldParNode, _, err := fs.getInodeFromId(op.OldParent)
 	if err != nil {
 		return err
 	}
-	newParNode, _, err := fs.getStageFileAndInode(op.NewParent)
+	newParNode, _, err := fs.getInodeFromId(op.NewParent)
 	if err != nil {
 		return err
 	}
-	return os.Rename(
+	err = os.Rename(
 		filePath(fs.stagePath(oldParNode), op.OldName),
 		filePath(fs.stagePath(newParNode), op.NewName))
+	if err != nil {
+		return err
+	}
+	// Dont create the inode for new file because we will generate one when we get a
+	// lookup call.
+	return fs.UnlinkInternal(op.OldParent, op.OldName)
 }
 
 // ====== FILE =======
 
 func (fs *FuseLogFs) getWriteFileHandle(
 	id fuseops.InodeID, handleID fuseops.HandleID) (*FileWriteHandle, error) {
-	_, _, err := fs.getStageFileAndInode(id)
+	_, _, err := fs.getInodeFromId(id)
 	if err != nil {
 		return nil, err
 	}
@@ -338,15 +400,16 @@ func (fs *FuseLogFs) getWriteFileHandle(
 	return handle, nil
 }
 
-func (fs *FuseLogFs) CreateFile(_ context.Context, op *fuseops.CreateFileOp) error {
-	fs.count += 1
-	if fs.count > 10 {
-		panic("too much")
-	}
+func (fs *FuseLogFs) CreateFile(_ context.Context, op *fuseops.CreateFileOp) (err error) {
+	logger.Info().Msgf("CreateFile begin:  -> %+v", op)
+	defer func() {
+		logger.Info().Msgf("CreateFile end:  -> %+v %v", op, err)
+	}()
+
 	fs.filemu.Lock()
 	defer fs.filemu.Unlock()
 
-	parNode, _, err := fs.getStageFileAndInode(op.Parent)
+	parNode, _, err := fs.getInodeFromId(op.Parent)
 	if err != nil {
 		return err
 	}
@@ -356,17 +419,18 @@ func (fs *FuseLogFs) CreateFile(_ context.Context, op *fuseops.CreateFileOp) err
 
 	_, err = os.Stat(childStagePath)
 	if err == nil {
-		logger.Info().Msgf("Remote EEXIST")
+		logger.Debug().Msgf("Remote EEXIST")
 		return syscall.EEXIST
 	} else if !os.IsNotExist(err) {
 		return err
-	} else if in, valid := fs.getInode(childPath); valid {
+	} else if in, valid := fs.getInodeFromPath(childPath); valid {
 		logger.Info().Msgf("potentially weird eexist %v %v", in, valid)
 		return syscall.EEXIST
 	}
 
 	handle := fs.newHandleNum()
-	newNode := fs.addInode(childPath)
+	newNode := fs.addNewOrReuseStaleInode(childPath)
+	fs.updateRefCount(newNode, 1)
 	if newNode == nil {
 		return syscall.EIO
 	}
@@ -407,7 +471,12 @@ func (fs *FuseLogFs) Fallocate(_ context.Context, op *fuseops.FallocateOp) error
 	return errors.New("implement me. why? ")
 }
 
-func (fs *FuseLogFs) FlushFile(_ context.Context, op *fuseops.FlushFileOp) error {
+func (fs *FuseLogFs) FlushFile(_ context.Context, op *fuseops.FlushFileOp) (err error) {
+	logger.Debug().Msgf("FlushFile begin:  -> %+v", op)
+	defer func() {
+		logger.Debug().Msgf("FlushFile end:  -> %+v %v", op, err)
+	}()
+
 	fs.filemu.Lock()
 	defer fs.filemu.Unlock()
 
@@ -421,8 +490,13 @@ func (fs *FuseLogFs) FlushFile(_ context.Context, op *fuseops.FlushFileOp) error
 	return handle.file.Close()
 }
 
-func (fs *FuseLogFs) OpenFile(_ context.Context, op *fuseops.OpenFileOp) error {
-	node, _, err := fs.getStageFileAndInode(op.Inode)
+func (fs *FuseLogFs) OpenFile(_ context.Context, op *fuseops.OpenFileOp) (err error) {
+	logger.Debug().Msgf("OpenFile begin:  -> %+v", op)
+	defer func() {
+		logger.Debug().Msgf("OpenFile end:  -> %+v %v", op, err)
+	}()
+
+	node, _, err := fs.getInodeFromId(op.Inode)
 	if err != nil {
 		return err
 	}
@@ -438,11 +512,16 @@ func (fs *FuseLogFs) OpenFile(_ context.Context, op *fuseops.OpenFileOp) error {
 	return nil
 }
 
-func (fs *FuseLogFs) WriteFile(_ context.Context, op *fuseops.WriteFileOp) error {
+func (fs *FuseLogFs) WriteFile(_ context.Context, op *fuseops.WriteFileOp) (err error) {
+	logger.Info().Msgf("WriteFile begin:  -> %+v", writeFileStr(op))
+	defer func() {
+		logger.Info().Msgf("WriteFile end:  -> %+v %v", writeFileStr(op), err)
+	}()
+
 	fs.filemu.Lock()
 	defer fs.filemu.Unlock()
 
-	logger.Info().Msgf("WriteFile: %v %v %v", op.Handle, op.Inode, op.Offset)
+	logger.Debug().Msgf("WriteFile: %v %v %v", op.Handle, op.Inode, op.Offset)
 
 	handle, err := fs.getWriteFileHandle(op.Inode, op.Handle)
 	if err != nil {
@@ -452,7 +531,12 @@ func (fs *FuseLogFs) WriteFile(_ context.Context, op *fuseops.WriteFileOp) error
 	return err
 }
 
-func (fs *FuseLogFs) SyncFile(_ context.Context, op *fuseops.SyncFileOp) error {
+func (fs *FuseLogFs) SyncFile(_ context.Context, op *fuseops.SyncFileOp) (err error) {
+	logger.Info().Msgf("WriteFile begin:  -> %+v", op)
+	defer func() {
+		logger.Info().Msgf("WriteFile end:  -> %+v %v", op, err)
+	}()
+
 	fs.filemu.Lock()
 	defer fs.filemu.Unlock()
 
@@ -468,8 +552,12 @@ func (fs *FuseLogFs) ReleaseFileHandle(_ context.Context, op *fuseops.ReleaseFil
 	return nil
 }
 
-func (fs *FuseLogFs) ReadFile(_ context.Context, op *fuseops.ReadFileOp) error {
-	node, _, err := fs.getStageFileAndInode(op.Inode)
+func (fs *FuseLogFs) ReadFile(_ context.Context, op *fuseops.ReadFileOp) (err error) {
+	logger.Debug().Msgf("ReadFile begin:  -> %+v", readFileStr(op))
+	defer func() {
+		logger.Debug().Msgf("ReadFile end:  -> %+v %v", readFileStr(op), err)
+	}()
+	node, _, err := fs.getInodeFromId(op.Inode)
 	if err != nil {
 		return err
 	}
@@ -478,20 +566,32 @@ func (fs *FuseLogFs) ReadFile(_ context.Context, op *fuseops.ReadFileOp) error {
 		return err
 	}
 	op.BytesRead, err = f.ReadAt(op.Dst, op.Offset)
+	if err == io.EOF {
+		err = nil // EOF is fine. sys call has no equivalent.
+	}
 	return err
 }
 
 func (fs *FuseLogFs) Unlink(_ context.Context, op *fuseops.UnlinkOp) error {
 	fs.filemu.Lock()
 	defer fs.filemu.Unlock()
-	parNode, _, err := fs.getStageFileAndInode(op.Parent)
+	return fs.UnlinkInternal(op.Parent, op.Name)
+}
+
+func (fs *FuseLogFs) UnlinkInternal(parentId fuseops.InodeID, nameToUnlink string) (err error) {
+	logger.Info().Msgf("UnlinkInternal begin:  -> %v %v", parentId, nameToUnlink)
+	defer func() {
+		logger.Info().Msgf("UnlinkInternal end:  -> %v %v %v", parentId, nameToUnlink, err)
+	}()
+
+	parNode, _, err := fs.getInodeFromId(parentId)
 	if err != nil {
 		return err
 	}
 
-	childNode, childValid := fs.getInode(filePath(parNode.paths[0], op.Name))
-	childPath := filePath(parNode.paths[0], op.Name)
-	childStagePath := filePath(fs.stagePath(parNode), op.Name)
+	childNode, childValid := fs.getInodeFromPath(filePath(parNode.paths[0], nameToUnlink))
+	childPath := filePath(parNode.paths[0], nameToUnlink)
+	childStagePath := filePath(fs.stagePath(parNode), nameToUnlink)
 	if !childValid {
 		return syscall.ENOENT
 	}
@@ -504,8 +604,8 @@ func (fs *FuseLogFs) Unlink(_ context.Context, op *fuseops.UnlinkOp) error {
 	if !childNode.removePath(childPath) {
 		return syscall.ENOENT
 	}
-	// After this we will still have this file in the inode maps
-	// All we are doing is remove the entry from Inode.paths
+	delete(fs.pathToInode, childPath)
+	// After this we will still have this inode in the inodes maps
 	// - For non hard linked items, Inode.paths []. In this case we are assuming
 	//   a subsequent call to forget inode will result in the inode being gone.
 	// - For hard linked files, path will be non empty.
@@ -515,7 +615,7 @@ func (fs *FuseLogFs) Unlink(_ context.Context, op *fuseops.UnlinkOp) error {
 // ====== DIR =======
 
 func (fs *FuseLogFs) ListFiles(dir fuseops.InodeID) ([]*fuseutil.Dirent, error) {
-	node, _, err := fs.getStageFileAndInode(dir)
+	node, _, err := fs.getInodeFromId(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -562,14 +662,14 @@ func (fs *FuseLogFs) ListFiles(dir fuseops.InodeID) ([]*fuseutil.Dirent, error) 
 }
 
 func (fs *FuseLogFs) MkDir(_ context.Context, op *fuseops.MkDirOp) error {
-	parNode, parStage, err := fs.getStageFileAndInode(op.Parent)
+	parNode, parStage, err := fs.getInodeFromId(op.Parent)
 	if err != nil {
 		return err
 	}
 
 	childStagePath := filePath(*parStage, op.Name)
 	childPath := filePath(parNode.paths[0], op.Name)
-	_, alreadyExists := fs.getInode(childPath)
+	_, alreadyExists := fs.getInodeFromPath(childPath)
 	if alreadyExists {
 		return syscall.EEXIST
 	}
@@ -582,7 +682,7 @@ func (fs *FuseLogFs) MkDir(_ context.Context, op *fuseops.MkDirOp) error {
 		return err
 	}
 
-	childNode := fs.addInode(childPath)
+	childNode := fs.addNewOrReuseStaleInode(childPath)
 	if childNode == nil {
 		return syscall.EIO
 	}
@@ -596,7 +696,7 @@ func (fs *FuseLogFs) MkDir(_ context.Context, op *fuseops.MkDirOp) error {
 }
 
 func (fs *FuseLogFs) OpenDir(_ context.Context, op *fuseops.OpenDirOp) error {
-	_, stagePath, err := fs.getStageFileAndInode(op.Inode)
+	_, stagePath, err := fs.getInodeFromId(op.Inode)
 	if err != nil {
 		return err
 	}
@@ -616,12 +716,12 @@ func (fs *FuseLogFs) RmDir(_ context.Context, op *fuseops.RmDirOp) error {
 	fs.filemu.Lock()
 	defer fs.filemu.Unlock()
 
-	parNode, _, err := fs.getStageFileAndInode(op.Parent)
+	parNode, _, err := fs.getInodeFromId(op.Parent)
 	if err != nil {
 		return err
 	}
 	childPath := filePath(parNode.paths[0], op.Name)
-	childNode, childIsValid := fs.getInode(childPath)
+	childNode, childIsValid := fs.getInodeFromPath(childPath)
 	if !childIsValid {
 		return syscall.ENOENT
 	}
@@ -629,7 +729,10 @@ func (fs *FuseLogFs) RmDir(_ context.Context, op *fuseops.RmDirOp) error {
 	if err != nil {
 		return err
 	}
+	// We will not have any hardlinks here.
+	// This is equivalent to the non-hardlink case in Unlink
 	childNode.paths = []string{}
+	delete(fs.pathToInode, childPath)
 	return nil
 }
 
@@ -640,18 +743,19 @@ func (fs *FuseLogFs) ReadDir(_ context.Context, op *fuseops.ReadDirOp) error {
 	}
 	op.BytesRead = 0
 	for i, item := range ls {
+		// NOTE: This can be efficient if we start iterating from the correct
+		// offset. But :/
 		if fuseops.DirOffset(i) <= op.Offset {
 			continue
 		}
-		logger.Info().Msgf("%+v", item)
 		cur := fuseutil.WriteDirent(op.Dst[op.BytesRead:], *item)
 		if cur == 0 {
+			// No more entries in this readdir page.
 			break
 		}
 		op.BytesRead += cur
 
 	}
-	logger.Info().Msgf("%+v", *op)
 	return nil
 }
 
@@ -662,7 +766,7 @@ func (*FuseLogFs) ReleaseDirHandle(context.Context, *fuseops.ReleaseDirHandleOp)
 // ====== ATTRIBUTES =======
 
 func (fs *FuseLogFs) GetInodeAttributes(_ context.Context, op *fuseops.GetInodeAttributesOp) error {
-	node, _, err := fs.getStageFileAndInode(op.Inode)
+	node, _, err := fs.getInodeFromId(op.Inode)
 	if err != nil {
 		return err
 	}
@@ -678,18 +782,21 @@ func (fs *FuseLogFs) GetInodeAttributes(_ context.Context, op *fuseops.GetInodeA
 }
 
 func (fs *FuseLogFs) SetInodeAttributes(_ context.Context, op *fuseops.SetInodeAttributesOp) error {
-	node, _, err := fs.getStageFileAndInode(op.Inode)
+	node, _, err := fs.getInodeFromId(op.Inode)
 	if err != nil {
 		return err
 	}
 	stagePath := fs.stagePath(node)
 
+	// Chmod if needed.
 	if op.Mode != nil {
 		err = os.Chmod(stagePath, *op.Mode)
 		if err != nil {
 			return err
 		}
 	}
+
+	// Chtimes if needed.
 	if op.Atime != nil || op.Mtime != nil {
 		statBefore, err := os.Stat(stagePath)
 		if err != nil {
@@ -707,6 +814,7 @@ func (fs *FuseLogFs) SetInodeAttributes(_ context.Context, op *fuseops.SetInodeA
 		}
 	}
 
+	// os.Stat and set the return values.
 	stat, err := os.Stat(fs.stagePath(node))
 	if err != nil {
 		return mapOsStatError(err)
@@ -720,7 +828,7 @@ func (fs *FuseLogFs) SetInodeAttributes(_ context.Context, op *fuseops.SetInodeA
 // ====== XATTRS =======
 
 func (fs *FuseLogFs) SetXattr(_ context.Context, op *fuseops.SetXattrOp) error {
-	_, stagePath, err := fs.getStageFileAndInode(op.Inode)
+	_, stagePath, err := fs.getInodeFromId(op.Inode)
 	if err != nil {
 		return err
 	}
@@ -733,12 +841,16 @@ func (fs *FuseLogFs) SetXattr(_ context.Context, op *fuseops.SetXattrOp) error {
 	return xattr.Set(*stagePath, op.Name, op.Value)
 }
 
-func (*FuseLogFs) RemoveXattr(context.Context, *fuseops.RemoveXattrOp) error {
-	return syscall.ENOATTR
+func (fs *FuseLogFs) RemoveXattr(_ context.Context, op *fuseops.RemoveXattrOp) error {
+	_, stagePath, err := fs.getInodeFromId(op.Inode)
+	if err != nil {
+		return err
+	}
+	return xattr.Remove(*stagePath, op.Name)
 }
 
 func (fs *FuseLogFs) GetXattr(_ context.Context, op *fuseops.GetXattrOp) error {
-	_, stagePath, err := fs.getStageFileAndInode(op.Inode)
+	_, stagePath, err := fs.getInodeFromId(op.Inode)
 	if err != nil {
 		return err
 	}
@@ -752,7 +864,7 @@ func (fs *FuseLogFs) GetXattr(_ context.Context, op *fuseops.GetXattrOp) error {
 }
 
 func (fs *FuseLogFs) ListXattr(_ context.Context, op *fuseops.ListXattrOp) error {
-	_, stagePath, err := fs.getStageFileAndInode(op.Inode)
+	_, stagePath, err := fs.getInodeFromId(op.Inode)
 	if err != nil {
 		return err
 	}
@@ -776,7 +888,7 @@ func (fs *FuseLogFs) ListXattr(_ context.Context, op *fuseops.ListXattrOp) error
 
 // ====== OTHERS =======
 
-func (*FuseLogFs) StatFS(ctx context.Context, op *fuseops.StatFSOp) error {
+func (*FuseLogFs) StatFS(_ context.Context, op *fuseops.StatFSOp) error {
 	kSize := uint64(1 << 40) // 1 TB
 	kBlockSize := uint32(4096)
 	numBlocks := kSize / uint64(kBlockSize)
@@ -787,7 +899,7 @@ func (*FuseLogFs) StatFS(ctx context.Context, op *fuseops.StatFSOp) error {
 	op.BlocksAvailable = numBlocks
 
 	op.IoSize = 1 << 20 // 1MB
-	op.Inodes = 1 << 20 // 1 Million
+	op.Inodes = 1 << 20 // ~1 Million
 	op.InodesFree = op.Inodes
 	return nil
 }
@@ -797,6 +909,7 @@ func (*FuseLogFs) Destroy() {
 
 // Misc functions
 
+// TODO: Why not filepath.Join
 func filePath(parPath, childName string) string {
 	c := strings.HasPrefix(childName, "/")
 	p := strings.HasSuffix(parPath, "/")
@@ -819,6 +932,20 @@ func osStatToInodeAttrs(stat os.FileInfo, node *Inode) fuseops.InodeAttributes {
 		Ctime:  stat.ModTime(),
 		Crtime: time.Unix(0, 0), // TODO: creation time.
 		Uid:    502,             // TODO: This is hardcoded to my current values
-		Gid:    20,              // TODO
+		Gid:    20,              // TODO: ^
 	}
+}
+
+// "Short" debug string for ReadFileOp.
+func readFileStr(op *fuseops.ReadFileOp) string {
+	return fmt.Sprintf(
+		"Inode: %v Handle: %v, Offset: %v Dst len: %v BytesRead: %v",
+		op.Inode, op.Handle, op.Offset, len(op.Dst), op.BytesRead)
+}
+
+// "Short" debug string for WriteFileOp.
+func writeFileStr(op *fuseops.WriteFileOp) string {
+	return fmt.Sprintf(
+		"Inode: %v Handle: %v, Offset: %v Data len: %v",
+		op.Inode, op.Handle, op.Offset, len(op.Data))
 }
