@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseutil"
+	"github.com/sevlyar/go-daemon"
 	"os"
 	"os/signal"
 	"os/user"
@@ -31,7 +32,7 @@ func unmount(mountDir string) {
 	if err != nil {
 		logger.Err(err).Msg("Failed to unmount")
 	} else {
-		logger.Warn().Msg("Unmounting fuse successful")
+		logger.Info().Msg("Unmounting fuse successful")
 	}
 }
 
@@ -62,13 +63,47 @@ func registerSIGINTHandler(mountDir string) {
 	}()
 }
 
+// "Forks" the current process.
+// - child process will return a daemon.Context which eventually needs to be "Release"d
+// - parent process will return nil.
+func fork() *daemon.Context {
+	ctx := new(daemon.Context)
+	child, err := ctx.Reborn()
+	if err != nil {
+		logger.Err(err).Msg("daemon::Reborn failed")
+	}
+
+	if child != nil {
+		logger.Info().Msgf("Launched child process pid:%v", child.Pid)
+		return nil
+	} else {
+		return ctx
+	}
+}
+
 func main() {
 	mountDir := flag.String("mount_dir", "/tmp/fool", "Mount destination")
 	stageDir := flag.String("stage_dir", "/tmp/foolstage", "Original location of the files exported by fuse")
 	logToFile := flag.Bool("log_to_file", true, "Whether to log to file or not")
+	daemonMode := flag.Bool("daemon", true,
+		"Whether to run as daemon or not. If running as daemon log_to_file should be true (default)")
 
 	flag.Parse()
-	logger = makeLogger("MAIN", true, false)
+
+	logger = makeLogger("MAIN", true, *logToFile)
+	if *daemonMode {
+		fmt.Println("daemon mode")
+		daemonCtx := fork()
+		if daemonCtx == nil {
+			return
+		}
+		defer func() {
+			err := daemonCtx.Release()
+			if err != nil {
+				logger.Err(err).Msg("Failed to release daemon context")
+			}
+		}()
+	}
 
 	fsName := "fuselogfs-at-" + *mountDir
 	mountConfig := fuse.MountConfig{
@@ -101,4 +136,8 @@ func main() {
 	if err != nil {
 		logger.Err(err).Msg("Program exited with error")
 	}
+
+	// TODO: Sleep for one sec for logs to flush. Does that make any sense?
+	//  From anecdotal evidence it seems that way.
+	time.Sleep(time.Second)
 }

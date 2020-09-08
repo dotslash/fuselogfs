@@ -960,13 +960,13 @@ func filePath(parPath, childName string) string {
 // "Short" debug string for ReadFileOp.
 func readFileStr(op *fuseops.ReadFileOp) string {
 	return fmt.Sprintf(
-		"Inode: %v Handle: %v, Offset: %v Dst len: %v BytesRead: %v",
+		"Inode:%v Handle:%v, Offset:%v Dst len:%v BytesRead:%v",
 		op.Inode, op.Handle, op.Offset, len(op.Dst), op.BytesRead)
 }
 
 // "Short" debug string for WriteFileOp.
 func writeFileStr(op *fuseops.WriteFileOp) string {
 	return fmt.Sprintf(
-		"Inode: %v Handle: %v, Offset: %v Data len: %v",
+		"Inode:%v Handle:%v, Offset:%v Data len:%v",
 		op.Inode, op.Handle, op.Offset, len(op.Data))
 }
