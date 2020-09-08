@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseutil"
 	"github.com/sevlyar/go-daemon"
@@ -29,11 +28,7 @@ func getUserOrDie() *user.User {
 func unmount(mountDir string) {
 	logger.Warn().Msg("Attempting to unmount fuse")
 	err := fuse.Unmount(mountDir)
-	if err != nil {
-		logger.Err(err).Msg("Failed to unmount")
-	} else {
-		logger.Info().Msg("Unmounting fuse successful")
-	}
+	logger.Err(err).Msg("Unmount finished")
 }
 
 func registerSIGINTHandler(mountDir string) {
@@ -70,11 +65,11 @@ func fork() *daemon.Context {
 	ctx := new(daemon.Context)
 	child, err := ctx.Reborn()
 	if err != nil {
-		logger.Err(err).Msg("daemon::Reborn failed")
+		stdOutLogger.Err(err).Msg("daemon::Reborn failed")
 	}
 
 	if child != nil {
-		logger.Info().Msgf("Launched child process pid:%v", child.Pid)
+		stdOutLogger.Info().Msgf("Launched child process pid:%v", child.Pid)
 		return nil
 	} else {
 		return ctx
@@ -91,17 +86,15 @@ func main() {
 	flag.Parse()
 
 	logger = makeLogger("MAIN", true, *logToFile)
+
 	if *daemonMode {
-		fmt.Println("daemon mode")
 		daemonCtx := fork()
 		if daemonCtx == nil {
 			return
 		}
 		defer func() {
 			err := daemonCtx.Release()
-			if err != nil {
-				logger.Err(err).Msg("Failed to release daemon context")
-			}
+			logger.Err(err).Msg("Release daemon context")
 		}()
 	}
 
@@ -128,14 +121,12 @@ func main() {
 	server := fuseutil.NewFileSystemServer(fs)
 	mfs, err := fuse.Mount(*mountDir, server, &mountConfig)
 	if err != nil {
-		fmt.Printf("Failed to mount: err=%v \n", err)
+		logger.Err(err).Msg("Failed to mount")
 		return
 	}
 	registerSIGINTHandler(*mountDir)
 	err = mfs.Join(context.Background())
-	if err != nil {
-		logger.Err(err).Msg("Program exited with error")
-	}
+	logger.Err(err).Msg("Join returned on mounted file system")
 
 	// TODO: Sleep for one sec for logs to flush. Does that make any sense?
 	//  From anecdotal evidence it seems that way.

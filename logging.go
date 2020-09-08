@@ -11,6 +11,15 @@ import (
 )
 
 var logger zerolog.Logger
+var stdOutLogger = makeLogger("MAIN", true, false)
+
+func errOrDebug(inpLog *zerolog.Logger, err error) *zerolog.Event {
+	if err != nil {
+		return inpLog.Error().Err(err)
+	} else {
+		return inpLog.Debug()
+	}
+}
 
 func makeLogDirOrDie() string {
 	usr := getUserOrDie()
@@ -44,13 +53,12 @@ func makeLogger(name string, logCaller bool, logToFile bool) zerolog.Logger {
 	if logCaller {
 		ctx = ctx.Caller()
 	}
-	l := ctx.Logger()
+	l := ctx.Logger().Level(zerolog.InfoLevel)
 	return l
 }
 
 func makeStdLogger(name string, logToFile bool) *log.Logger {
 	zlog := makeLogger(name, false, logToFile)
-	zlog = zlog.Level(zerolog.InfoLevel)
 	ret := log.New(os.Stdout, "", 0)
 	ret.SetFlags(0)
 	ret.SetPrefix("")

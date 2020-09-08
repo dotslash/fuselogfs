@@ -279,9 +279,8 @@ func (fs *FuseLogFs) newHandleNum() fuseops.HandleID {
 // ====== LINKS =======
 
 func (fs *FuseLogFs) CreateLink(_ context.Context, op *fuseops.CreateLinkOp) (err error) {
-	logger.Info().Msgf("CreateLink begin:  -> %+v", op)
 	defer func() {
-		logger.Info().Msgf("CreateLink end:  -> %+v %v", op, err)
+		logger.Err(err).Msgf("CreateLink end:  -> %+v", op)
 	}()
 
 	// Get par node info.
@@ -323,9 +322,8 @@ func (fs *FuseLogFs) CreateLink(_ context.Context, op *fuseops.CreateLinkOp) (er
 }
 
 func (fs *FuseLogFs) CreateSymlink(_ context.Context, op *fuseops.CreateSymlinkOp) (err error) {
-	logger.Info().Msgf("CreateSymLink begin:  -> %+v", op)
 	defer func() {
-		logger.Info().Msgf("CreateSymLink end:  -> %+v %v", op, err)
+		logger.Err(err).Msgf("CreateSymLink end:  -> %+v", op)
 	}()
 
 	// Get par node info.
@@ -392,9 +390,8 @@ func mapOsStatError(err error) error {
 }
 
 func (fs *FuseLogFs) Rename(_ context.Context, op *fuseops.RenameOp) (err error) {
-	logger.Info().Msgf("Rename begin:  -> %+v", op)
 	defer func() {
-		logger.Info().Msgf("Rename end:  -> %+v %v", op, err)
+		logger.Err(err).Msgf("Rename end:  -> %+v", op)
 	}()
 
 	fs.filemu.Lock()
@@ -440,9 +437,8 @@ func (fs *FuseLogFs) getWriteFileHandle(
 }
 
 func (fs *FuseLogFs) CreateFile(_ context.Context, op *fuseops.CreateFileOp) (err error) {
-	logger.Info().Msgf("CreateFile begin:  -> %+v", op)
 	defer func() {
-		logger.Info().Msgf("CreateFile end:  -> %+v %v", op, err)
+		logger.Err(err).Msgf("CreateFile end:  -> %+v", op)
 	}()
 
 	fs.filemu.Lock()
@@ -509,9 +505,8 @@ func (fs *FuseLogFs) Fallocate(_ context.Context, op *fuseops.FallocateOp) error
 }
 
 func (fs *FuseLogFs) FlushFile(_ context.Context, op *fuseops.FlushFileOp) (err error) {
-	logger.Debug().Msgf("FlushFile begin:  -> %+v", op)
 	defer func() {
-		logger.Debug().Msgf("FlushFile end:  -> %+v %v", op, err)
+		errOrDebug(&logger, err).Msgf("FlushFile end:  -> %+v", op)
 	}()
 
 	fs.filemu.Lock()
@@ -528,9 +523,8 @@ func (fs *FuseLogFs) FlushFile(_ context.Context, op *fuseops.FlushFileOp) (err 
 }
 
 func (fs *FuseLogFs) OpenFile(_ context.Context, op *fuseops.OpenFileOp) (err error) {
-	logger.Debug().Msgf("OpenFile begin:  -> %+v", op)
 	defer func() {
-		logger.Debug().Msgf("OpenFile end:  -> %+v %v", op, err)
+		errOrDebug(&logger, err).Msgf("OpenFile end:  -> %+v", op)
 	}()
 
 	node, _, err := fs.getInodeFromId(op.Inode)
@@ -550,9 +544,8 @@ func (fs *FuseLogFs) OpenFile(_ context.Context, op *fuseops.OpenFileOp) (err er
 }
 
 func (fs *FuseLogFs) WriteFile(_ context.Context, op *fuseops.WriteFileOp) (err error) {
-	logger.Info().Msgf("WriteFile begin:  -> %+v", writeFileStr(op))
 	defer func() {
-		logger.Info().Msgf("WriteFile end:  -> %+v %v", writeFileStr(op), err)
+		logger.Err(err).Msgf("WriteFile end:  -> %v", writeFileStr(op))
 	}()
 
 	fs.filemu.Lock()
@@ -567,9 +560,8 @@ func (fs *FuseLogFs) WriteFile(_ context.Context, op *fuseops.WriteFileOp) (err 
 }
 
 func (fs *FuseLogFs) SyncFile(_ context.Context, op *fuseops.SyncFileOp) (err error) {
-	logger.Info().Msgf("WriteFile begin:  -> %+v", op)
 	defer func() {
-		logger.Info().Msgf("WriteFile end:  -> %+v %v", op, err)
+		logger.Err(err).Msgf("WriteFile end:  -> %+v", op)
 	}()
 
 	fs.filemu.Lock()
@@ -588,9 +580,8 @@ func (fs *FuseLogFs) ReleaseFileHandle(_ context.Context, op *fuseops.ReleaseFil
 }
 
 func (fs *FuseLogFs) ReadFile(_ context.Context, op *fuseops.ReadFileOp) (err error) {
-	logger.Debug().Msgf("ReadFile begin:  -> %+v", readFileStr(op))
 	defer func() {
-		logger.Debug().Msgf("ReadFile end:  -> %+v %v", readFileStr(op), err)
+		errOrDebug(&logger, err).Msgf("ReadFile end:  -> %v", readFileStr(op))
 	}()
 	node, _, err := fs.getInodeFromId(op.Inode)
 	if err != nil {
@@ -614,7 +605,6 @@ func (fs *FuseLogFs) Unlink(_ context.Context, op *fuseops.UnlinkOp) error {
 }
 
 func (fs *FuseLogFs) UnlinkInternal(parentId fuseops.InodeID, nameToUnlink string) (err error) {
-	logger.Info().Msgf("UnlinkInternal begin:  -> %v %v", parentId, nameToUnlink)
 	defer func() {
 		logger.Info().Msgf("UnlinkInternal end:  -> %v %v %v", parentId, nameToUnlink, err)
 	}()
